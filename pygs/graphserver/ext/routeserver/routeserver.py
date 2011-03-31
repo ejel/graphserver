@@ -1,4 +1,3 @@
-from servable import Servable
 from graphserver.graphdb import GraphDatabase
 import cgi
 from graphserver.core import State, WalkOptions
@@ -13,7 +12,8 @@ except ImportError:
     import simplejson as json
 import yaml
 import os
-from fcgi import WSGIServer
+import cherrypy
+import cherrypy.process.servers
     
 from events import BoardEvent, AlightEvent, HeadwayBoardEvent, HeadwayAlightEvent, StreetEvent, StreetTurnEvent
 
@@ -60,7 +60,7 @@ def postprocess_path(vertices, edges, vertex_events, edge_events):
                 if event is not None:
                     yield handler.__class__.__name__, event
 
-class RouteServer(Servable):
+class RouteServer(object):
     def __init__(self, graphdb_filename, vertex_events, edge_events, vertex_reverse_geocoders):
         graphdb = GraphDatabase( graphdb_filename )
         self.graph = graphdb.incarnate()
@@ -68,6 +68,7 @@ class RouteServer(Servable):
         self.edge_events = edge_events
         self.vertex_reverse_geocoders = vertex_reverse_geocoders
         
+    @cherrypy.expose
     def bounds(self, jsoncallback=None):
         """returns bounding box that encompases the bounding box from all member reverse geocoders"""
         
@@ -85,11 +86,14 @@ class RouteServer(Servable):
         else:
             return "%s(%s)"%(jsoncallback,json.dumps([l,b,r,t]))
     
+    @cherrypy.expose
     def vertices(self):
         return "\n".join( [vv.label for vv in self.graph.vertices] )
     vertices.mime = "text/plain"
     
+    @cherrypy.expose
     def get_vertex_id_raw( self, lat, lon ):
+        lat, lon = float(lat), float(lon)
         for reverse_geocoder in self.vertex_reverse_geocoders:
             ret = reverse_geocoder( lat, lon )
             if ret is not None:
@@ -97,11 +101,14 @@ class RouteServer(Servable):
                 
         return None
         
+    @cherrypy.expose
     def get_vertex_id( self, lat, lon ):
+        lat, lon = float(lat), float(lon)
         return json.dumps( self.get_vertex_id_raw( lat, lon ) )
 
+    @cherrypy.expose
     def path(self, 
-             origin, 
+             origin,
              dest,
              currtime=None, 
              time_offset=None, 
@@ -158,7 +165,8 @@ class RouteServer(Servable):
         else:
             return "%s(%s)"%(jsoncallback,json.dumps(ret, indent=2, cls=SelfEncoderHelper))
             
-    def geompath(self, lat1,lon1,lat2,lon2, 
+    @cherrypy.expose
+    def geompath(self, lat1,lon1,lat2,lon2,
                  currtime=None, 
                  time_offset=None, 
                  transfer_penalty=0, 
@@ -188,6 +196,7 @@ class RouteServer(Servable):
                      max_walk,
                      jsoncallback )
         
+    @cherrypy.expose
     def path_retro(self, origin, dest, currtime=None, time_offset=None, transfer_penalty=0, walking_speed=1.0):
         if currtime is None:
             currtime = int(time.time())
@@ -209,6 +218,7 @@ class RouteServer(Servable):
         
         return json.dumps(ret, indent=2, cls=SelfEncoderHelper)
 
+    @cherrypy.expose
     def path_raw(self, origin, dest, currtime=None):
         if currtime is None:
             currtime = int(time.time())
@@ -225,10 +235,11 @@ class RouteServer(Servable):
         
         return ret
         
+    @cherrypy.expose
     def path_raw_retro(self, origin, dest, currtime):
         
         wo = WalkOptions()
-        spt = self.graph.shortest_path_tree_retro( origin, dest, State(1,currtime), wo )
+        spt = self.graph.shortest_path_tree_retro( origin, dest, State(1,int(currtime)), wo )
         wo.destroy()
         
         vertices, edges = spt.path_retro( origin )
@@ -309,13 +320,26 @@ def main():
     
     # start up the routeserver
     gc = RouteServer(graphdb_filename, vertex_events, edge_events, vertex_reverse_geocoders)
-    
+    port = int(options.port)
+    cherrypy.config.update({'server.socket_port' : port})
+    cherrypy.tree.mount(gc)
+
     # serve as either an HTTP server or an fastCGI backend
     if options.socket:
         print "Starting fastCGI backend serving at %s"%options.socket
-        WSGIServer(gc.wsgi_app(), bindAddress = options.socket).run()
+        cherrypy.config.update({'engine.autoreload_on': False})
+        # turn off the default HTTP server
+        cherrypy.server.unsubscribe()
+        addr = (options.socket, port)
+        f = cherrypy.process.servers.FlupFCGIServer(application=cherrypy.tree, bindAddress=addr)
+        s = cherrypy.process.servers.ServerAdapter(cherrypy.engine, httpserver=f, bind_addr=addr)
+        s.subscribe()
+    try:
+        cherrypy.engine.start()
+    except:
+        sys.exit(1)
     else:
-        gc.run_test_server(port=int(options.port))
+        cherrypy.engine.block()
 
 if __name__ == '__main__':
     main()
